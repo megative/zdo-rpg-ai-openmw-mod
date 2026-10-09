@@ -459,132 +459,86 @@ local function handlePlaySound3dOnCharacter(msg)
     end
 end
 
-local function handleNpcStartFollowCharacter(msg)
+-- 'player' is how the server refers to the player character
+local function findActor(id)
+    if not id then return nil end
+    if playerObject and (id == 'player' or id == playerObject.recordId) then return playerObject end
+    return activeNpcs[id]
+end
+
+-- Actions reply with { success, error }, so the server can tell the NPC when the game refused
+local function respondResult(msg, ok, err)
+    if not ok then
+        print('[ZDORPG] ' .. tostring(msg.type) .. ' failed: ' .. tostring(err))
+    end
+    respond(msg.type, msg.id, { success = ok, error = err })
+end
+
+local function startAiPackage(msg, packageType)
     local data = msg.data or {}
-    local npcId = data.npcId
-    local targetId = data.targetCharacterId
+    local npc = activeNpcs[data.npcId]
+    local target = findActor(data.targetCharacterId)
+    if not npc then return respondResult(msg, false, 'npc not found') end
+    if not target then return respondResult(msg, false, 'target not found') end
 
-    if not npcId or not targetId then
-        print('[ZDORPG] NpcStartFollow: missing npcId or targetCharacterId')
-        return
+    local ok, err = pcall(function()
+        npc:sendEvent('RemoveAIPackages', packageType)
+        npc:sendEvent('StartAIPackage', { type = packageType, target = target })
+    end)
+    respondResult(msg, ok, not ok and tostring(err) or nil)
+end
+
+local function removeAiPackages(msg, packageType)
+    local data = msg.data or {}
+    local npc = activeNpcs[data.npcId]
+    if not npc then return respondResult(msg, false, 'npc not found') end
+
+    local ok, err = pcall(function() npc:sendEvent('RemoveAIPackages', packageType) end)
+    respondResult(msg, ok, not ok and tostring(err) or nil)
+end
+
+local function handleNpcStartFollowCharacter(msg) startAiPackage(msg, 'Follow') end
+local function handleNpcStopFollowCharacter(msg) removeAiPackages(msg, 'Follow') end
+local function handleNpcAttack(msg) startAiPackage(msg, 'Combat') end
+local function handleNpcStopAttack(msg) removeAiPackages(msg, 'Combat') end
+
+-- Moves the actual stacks, so condition, charge and souls survive. Checking that the giver
+-- really has the items follows waterbobo24's Morrowind-llm-mod.
+local function handleTransferItem(msg)
+    local data = msg.data or {}
+    local from = findActor(data.fromCharacterId)
+    local to = findActor(data.toCharacterId)
+    local itemId = data.itemId and string.lower(data.itemId)
+    local count = math.floor(tonumber(data.count) or 0)
+    if not from or not to then return respondResult(msg, false, 'character not found') end
+    if not itemId or count < 1 then return respondResult(msg, false, 'no item or count') end
+
+    local inventory = types.Actor.inventory(from)
+    pcall(function()
+        if not inventory:isResolved() then inventory:resolve() end
+    end)
+    local have = inventory:countOf(itemId)
+    if have < count then
+        return respondResult(msg, false, have == 0 and 'does not have it' or ('has only ' .. have))
     end
 
-    local npc = activeNpcs[npcId]
-    if not npc then
-        print('[ZDORPG] NpcStartFollow: NPC not found: ' .. tostring(npcId))
-        return
-    end
-
-    local target = activeNpcs[targetId]
-    if not target then
-        if playerObject and playerObject.recordId == targetId then
-            target = playerObject
-        else
-            print('[ZDORPG] NpcStartFollow: target not found: ' .. tostring(targetId))
-            return
+    local name = nil
+    local ok, err = pcall(function()
+        local target = types.Actor.inventory(to)
+        local remaining = count
+        for _, stack in ipairs(inventory:findAll(itemId)) do
+            if remaining <= 0 then break end
+            name = name or itemName(stack)
+            local amount = math.min(remaining, stack.count)
+            local moving = amount < stack.count and stack:split(amount) or stack
+            moving:moveInto(target)
+            remaining = remaining - amount
         end
-    end
-
-    local ok, err = pcall(function()
-        npc:sendEvent('RemoveAIPackages', 'Follow')
-        npc:sendEvent('StartAIPackage', {type = 'Follow', target = target})
     end)
     if not ok then
-        print('[ZDORPG] NpcStartFollow: failed: ' .. tostring(err))
-        return
+        print('[ZDORPG] TransferItem failed: ' .. tostring(err))
     end
-
-    print('[ZDORPG] NPC ' .. tostring(npcId) .. ' now following ' .. tostring(targetId))
-end
-
-local function handleNpcStopFollowCharacter(msg)
-    local data = msg.data or {}
-    local npcId = data.npcId
-
-    if not npcId then
-        print('[ZDORPG] NpcStopFollow: missing npcId')
-        return
-    end
-
-    local npc = activeNpcs[npcId]
-    if not npc then
-        print('[ZDORPG] NpcStopFollow: NPC not found: ' .. tostring(npcId))
-        return
-    end
-
-    local ok, err = pcall(function()
-        npc:sendEvent('RemoveAIPackages', 'Follow')
-    end)
-    if not ok then
-        print('[ZDORPG] NpcStopFollow: failed: ' .. tostring(err))
-        return
-    end
-
-    print('[ZDORPG] NPC ' .. tostring(npcId) .. ' stopped following')
-end
-
-local function handleNpcAttack(msg)
-    local data = msg.data or {}
-    local npcId = data.npcId
-    local targetId = data.targetCharacterId
-
-    if not npcId or not targetId then
-        print('[ZDORPG] NpcAttack: missing npcId or targetCharacterId')
-        return
-    end
-
-    local npc = activeNpcs[npcId]
-    if not npc then
-        print('[ZDORPG] NpcAttack: NPC not found: ' .. tostring(npcId))
-        return
-    end
-
-    local target = activeNpcs[targetId]
-    if not target then
-        if playerObject and playerObject.recordId == targetId then
-            target = playerObject
-        else
-            print('[ZDORPG] NpcAttack: target not found: ' .. tostring(targetId))
-            return
-        end
-    end
-
-    local ok, err = pcall(function()
-        npc:sendEvent('RemoveAIPackages', 'Combat')
-        npc:sendEvent('StartAIPackage', {type = 'Combat', target = target})
-    end)
-    if not ok then
-        print('[ZDORPG] NpcAttack: failed: ' .. tostring(err))
-        return
-    end
-
-    print('[ZDORPG] NPC ' .. tostring(npcId) .. ' attacking ' .. tostring(targetId))
-end
-
-local function handleNpcStopAttack(msg)
-    local data = msg.data or {}
-    local npcId = data.npcId
-
-    if not npcId then
-        print('[ZDORPG] NpcStopAttack: missing npcId')
-        return
-    end
-
-    local npc = activeNpcs[npcId]
-    if not npc then
-        print('[ZDORPG] NpcStopAttack: NPC not found: ' .. tostring(npcId))
-        return
-    end
-
-    local ok, err = pcall(function()
-        npc:sendEvent('RemoveAIPackages', 'Combat')
-    end)
-    if not ok then
-        print('[ZDORPG] NpcStopAttack: failed: ' .. tostring(err))
-        return
-    end
-
-    print('[ZDORPG] NPC ' .. tostring(npcId) .. ' stopped attacking')
+    respond('TransferItem', msg.id, { success = ok, error = not ok and tostring(err) or nil, itemName = name })
 end
 
 local function handleShowMessageBox(msg)
@@ -632,6 +586,8 @@ local function processIncomingMessage(msg)
         handleNpcStopAttack(msg)
     elseif msg.type == 'ShowMessageBox' then
         handleShowMessageBox(msg)
+    elseif msg.type == 'TransferItem' then
+        handleTransferItem(msg)
     else
         print('[ZDORPG:ERROR] Unknown message type: ' .. tostring(msg.type))
     end
