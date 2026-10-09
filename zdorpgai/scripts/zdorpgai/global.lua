@@ -10,6 +10,7 @@ local calendar = require('openmw_aux.calendar')
 
 local ipc = require('scripts.zdorpgai.ipc')
 local json = require('scripts.zdorpgai.json')
+local questlines = require('scripts.zdorpgai.questlines')
 
 -- State
 local POLL_INTERVAL_FRAMES = 5
@@ -279,6 +280,138 @@ local function playerFactions(player)
 end
 
 -------------------------------------------------------------------------------
+-- The game's own dialogue
+-------------------------------------------------------------------------------
+
+-- An NPC as dialogue filters and text placeholders see it
+local function whoFor(npc)
+    local okRec, record = pcall(types.NPC.record, npc)
+    if not npc or not okRec or not record then return nil end
+
+    local factionIds = select(2, pcall(types.NPC.getFactions, npc))
+    local factionId = type(factionIds) ~= 'string' and factionIds and factionIds[1] or nil
+    local okRank, rank = pcall(types.NPC.getFactionRank, npc, factionId)
+    local factionName, rankName = getFaction(npc)
+    local player = playerObject and getCharacterInfo(playerObject)
+    return {
+        id = npc.recordId, race = record.race, class = record.class, gender = record.isMale and 'male' or 'female',
+        faction = factionId, rank = okRank and rank or 0, disposition = dispositionOf(npc),
+        playerCell = playerObject and cellName(playerObject) or '',
+        name = record.name, raceName = recordName(types.NPC.races, record.race), className = recordName(types.NPC.classes, record.class),
+        factionName = factionName, rankName = rankName,
+        playerName = player and player.name, playerRace = player and recordName(types.NPC.races, player.race),
+        playerClass = player and player.className,
+    }
+end
+
+-- Fills placeholders like %PCName and drops the @link# marks
+local function dialogueText(text, who)
+    local values = {
+        PCName = who.playerName, PCRace = who.playerRace, PCClass = who.playerClass,
+        Name = who.name, Race = who.raceName, Class = who.className, Faction = who.factionName,
+        Rank = who.rankName, Cell = who.playerCell,
+    }
+    local filled = string.gsub(text, '%%(%a+)', function(key)
+        return values[key] or ('%' .. key)
+    end)
+    return questlines.plainText(filled)
+end
+
+-- NPC record id -> its own dialogue lines that move a quest on (see questlines.lua). Gathered
+-- once, a little each frame: infos sit in linked lists, and walking all of them takes a while.
+local questLines = nil
+local questLinesBuilder = nil
+local QUEST_LINES_BUDGET_SEC = 0.002
+
+local function gatherQuestLines()
+    local index = {}
+    local deadline = core.getRealTime() + QUEST_LINES_BUDGET_SEC
+    local sources = { { core.dialogue.topic.records, false }, { core.dialogue.greeting.records, true } }
+    for _, source in ipairs(sources) do
+        local isGreeting = source[2]
+        for _, dialogue in ipairs(source[1]) do
+            local infos = dialogue.infos
+            for i = 1, #infos do
+                local info = infos[i]
+                local actorId = info.filterActorId
+                if actorId and actorId ~= '' then
+                    for _, call in ipairs(questlines.journalCalls(info.resultScript)) do
+                        local key = string.lower(actorId)
+                        index[key] = index[key] or {}
+                        table.insert(index[key], {
+                            -- A greeting comes as soon as the dialogue opens, no topic needed
+                            topic = not isGreeting and (dialogue.name or dialogue.id) or nil,
+                            text = info.text, questId = call.questId, stage = call.stage,
+                        })
+                    end
+                end
+                if core.getRealTime() > deadline then
+                    coroutine.yield()
+                    deadline = core.getRealTime() + QUEST_LINES_BUDGET_SEC
+                end
+            end
+        end
+    end
+    return index
+end
+
+local function updateQuestLines()
+    if questLines then return end
+    questLinesBuilder = questLinesBuilder or coroutine.create(gatherQuestLines)
+    local ok, result = coroutine.resume(questLinesBuilder)
+    if not ok then
+        print('[ZDORPG] Failed to gather quest lines: ' .. tostring(result))
+        questLines = {}
+    elseif coroutine.status(questLinesBuilder) == 'dead' then
+        questLines = result
+        local count = 0
+        for _ in pairs(result) do count = count + 1 end
+        print('[ZDORPG] Gathered the quest lines of ' .. count .. ' NPCs')
+    end
+end
+
+-- The journal entry a quest stage writes, and whether it finishes the quest
+local function journalStage(questId, stage)
+    local journal = core.dialogue.journal.records[questId]
+    if not journal then return nil, false end
+    for _, info in ipairs(journal.infos) do
+        if info.questStage == stage then
+            return questlines.plainText(info.text), info.isQuestFinished
+        end
+    end
+    return nil, false
+end
+
+-- The next quest steps this NPC gives in the game's dialogue, as far as the player's journal goes
+local function questTopicsFor(npc, limit)
+    local result = json.array()
+    local lines = questLines and npc and questLines[string.lower(npc.recordId)]
+    if not lines or not playerObject then return result end
+    local okQuests, quests = pcall(types.Player.quests, playerObject)
+    if not okQuests or not quests then return result end
+    local function questState(questId)
+        local ok, quest = pcall(function() return quests[questId] end)
+        if ok and quest then return quest.stage, quest.finished end
+        return nil
+    end
+
+    local who = whoFor(npc)
+    for _, step in ipairs(questlines.nextSteps(lines, questState, limit)) do
+        local entry, finishes = journalStage(step.questId, step.stage)
+        local okName, questName = pcall(function() return core.dialogue.journal.records[step.questId].questName end)
+        result[#result + 1] = {
+            topic = step.topic,
+            quest = okName and questName ~= '' and questName or nil,
+            starts = questState(step.questId) == 0,
+            finishes = finishes or false,
+            line = who and dialogueText(step.text, who) or questlines.plainText(step.text),
+            entry = entry,
+        }
+    end
+    return result
+end
+
+-------------------------------------------------------------------------------
 -- Conversation hold: the NPC stops and faces the player (see npc.lua)
 -------------------------------------------------------------------------------
 
@@ -352,6 +485,11 @@ local function handleGetSceneContext(msg)
 
     local npc = activeNpcs[data.npcId]
     if npc then
+        -- A bonus: if it fails, the reply still gets the rest of the scene
+        local okQuests, questTopics = pcall(questTopicsFor, npc, 4)
+        if not okQuests then
+            print('[ZDORPG] Quest topics failed: ' .. tostring(questTopics))
+        end
         response.npc = {
             level = actorLevel(npc),
             healthRatio = dynamicRatio(types.Actor.stats.dynamic.health, npc),
@@ -360,6 +498,7 @@ local function handleGetSceneContext(msg)
             items = inventoryItems(npc, 12),
             disposition = dispositionOf(npc),
             services = offeredServices(npc),
+            questTopics = okQuests and questTopics or nil,
         }
     end
 
@@ -817,17 +956,6 @@ local function infoMatches(info, who)
     return true
 end
 
-local function fillPlaceholders(text, who)
-    local values = {
-        PCName = who.playerName, PCRace = who.playerRace, PCClass = who.playerClass,
-        Name = who.name, Race = who.raceName, Class = who.className, Faction = who.factionName,
-        Rank = who.rankName, Cell = who.playerCell,
-    }
-    return (string.gsub(text, '%%(%a+)', function(key)
-        return values[key] or ('%' .. key)
-    end))
-end
-
 local function handleGetTopics(msg)
     local topics = json.array()
     for _, topic in ipairs(core.dialogue.topic.records) do
@@ -842,26 +970,11 @@ local function handleGetTopicLines(msg)
     local npc = activeNpcs[data.npcId]
     local limit = data.limit or 3
     local result = json.array()
-    local okRec, record = pcall(types.NPC.record, npc)
-    if not npc or not okRec or not record then
+    local who = whoFor(npc)
+    if not who then
         respond('GetTopicLines', msg.id, { topics = result })
         return
     end
-
-    local factionIds = select(2, pcall(types.NPC.getFactions, npc))
-    local factionId = type(factionIds) ~= 'string' and factionIds and factionIds[1] or nil
-    local okRank, rank = pcall(types.NPC.getFactionRank, npc, factionId)
-    local factionName, rankName = getFaction(npc)
-    local player = playerObject and getCharacterInfo(playerObject)
-    local who = {
-        id = npc.recordId, race = record.race, class = record.class, gender = record.isMale and 'male' or 'female',
-        faction = factionId, rank = okRank and rank or 0, disposition = dispositionOf(npc),
-        playerCell = playerObject and cellName(playerObject) or '',
-        name = record.name, raceName = recordName(types.NPC.races, record.race), className = recordName(types.NPC.classes, record.class),
-        factionName = factionName, rankName = rankName,
-        playerName = player and player.name, playerRace = player and recordName(types.NPC.races, player.race),
-        playerClass = player and player.className,
-    }
 
     for _, topicId in ipairs(data.topics or {}) do
         local topic = core.dialogue.topic.records[topicId]
@@ -869,7 +982,7 @@ local function handleGetTopicLines(msg)
             local lines = json.array()
             for _, info in ipairs(topicInfos(topic)) do
                 if infoMatches(info, who) then
-                    lines[#lines + 1] = fillPlaceholders(info.text, who)
+                    lines[#lines + 1] = dialogueText(info.text, who)
                     if #lines >= limit then break end
                 end
             end
@@ -982,6 +1095,7 @@ end
 
 local function onUpdate(dt)
     updatePendingDialogue()
+    updateQuestLines()
 
     frameCounter = frameCounter + 1
     if frameCounter % POLL_INTERVAL_FRAMES ~= 0 then return end
