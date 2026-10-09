@@ -721,8 +721,9 @@ local function updatePendingDialogue()
 
     local waited = now - pending.requestedAt
     local finishedSpeaking = pending.spoke and now - pending.quietSince > 1
-    -- Without a spoken line, or if it never ends, don't wait forever
-    if finishedSpeaking or (not pending.spoke and waited > 4) or waited > 30 then
+    -- The line can take a while: the server may ask the model for words after its actions, then
+    -- voice them. Without a spoken line, or if it never ends, don't wait forever.
+    if finishedSpeaking or (not pending.spoke and waited > 10) or waited > 40 then
         pendingDialogue = nil
         local ok, err = pcall(function() pending.npc:activateBy(playerObject) end)
         if not ok then
