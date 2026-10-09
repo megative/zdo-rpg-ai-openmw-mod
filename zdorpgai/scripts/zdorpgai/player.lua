@@ -294,6 +294,15 @@ local function onNotify(data)
     ui.showMessage(data.text or '')
 end
 
+local TASK_MESSAGES = { Open = 'taskNew', Done = 'taskDone', Cancelled = 'taskCancelled' }
+
+local function onTaskUpdate(data)
+    local key = TASK_MESSAGES[data.status]
+    if key then
+        ui.showMessage(L(key, { npc = data.npcName or '', task = data.task or '' }))
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Save / Load
 -------------------------------------------------------------------------------
@@ -337,5 +346,6 @@ return {
         ZdorpgShowListening = onShowListening,
         ZdorpgHideListening = onHideListening,
         ZdorpgNotify = onNotify,
+        ZdorpgTaskUpdate = onTaskUpdate,
     },
 }

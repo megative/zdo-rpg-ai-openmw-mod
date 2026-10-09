@@ -21,6 +21,7 @@ local playerObject = nil
 local activeNpcs = {}
 local clientConnected = false
 local currentSessionId = nil
+local lastTargetNpcId = nil
 
 -- Identifies the playthrough: the server keeps a separate memory per save id. It is stored in
 -- saves; saves from before it existed load as 'default', the memory the server already had.
@@ -52,7 +53,7 @@ end
 
 -- Display name of a record (class, region, ...), falling back to its id
 local function recordName(store, id)
-    if not id then return nil end
+    if not id or id == '' then return nil end
     local ok, record = pcall(function() return store.records[id] end)
     if ok and record and record.name and record.name ~= '' then return record.name end
     return id
@@ -194,6 +195,76 @@ local function inventoryItems(actor, limit)
     return items
 end
 
+local function dispositionOf(npc)
+    if not playerObject then return nil end
+    local ok, value = pcall(types.NPC.getDisposition, npc, playerObject)
+    return ok and value or nil
+end
+
+-- Our service names, the servicesOffered flag behind each and the window that serves it
+local SERVICES = {
+    barter = { offered = 'Barter', mode = 'Barter' },
+    training = { offered = 'Training', mode = 'Training' },
+    travel = { offered = 'Travel', mode = 'Travel' },
+    spells = { offered = 'Spells', mode = 'SpellBuying' },
+    repair = { offered = 'Repair', mode = 'MerchantRepair' },
+}
+
+local function offersService(npc, service)
+    local ok, offered = pcall(function() return types.NPC.record(npc).servicesOffered[service.offered] end)
+    return ok and offered == true
+end
+
+local function offeredServices(npc)
+    local names = json.array()
+    for name, service in pairs(SERVICES) do
+        if offersService(npc, service) then names[#names + 1] = name end
+    end
+    table.sort(names)
+    return names
+end
+
+local function crimeLevelOf(player)
+    local ok, bounty = pcall(types.Player.getCrimeLevel, player)
+    return ok and bounty or 0
+end
+
+-- Factions the player belongs to and wasn't expelled from, with rank titles
+local function playerFactions(player)
+    local factions = json.array()
+    local ok, factionIds = pcall(types.NPC.getFactions, player)
+    if not ok or not factionIds then return factions end
+    for _, factionId in ipairs(factionIds) do
+        local okExpelled, expelled = pcall(types.NPC.isExpelled, player, factionId)
+        if not (okExpelled and expelled) then
+            local faction = core.factions.records[factionId]
+            local okRank, rank = pcall(types.NPC.getFactionRank, player, factionId)
+            local rankRecord = okRank and rank and rank > 0 and faction and faction.ranks[rank]
+            factions[#factions + 1] = {
+                name = faction and faction.name or factionId,
+                rank = rankRecord and rankRecord.name or nil,
+            }
+        end
+    end
+    return factions
+end
+
+-------------------------------------------------------------------------------
+-- Conversation hold: the NPC stops and faces the player (see npc.lua)
+-------------------------------------------------------------------------------
+
+-- facing: who the NPC turns to, the player by default
+local function holdNpc(npc, seconds, facing)
+    facing = facing or playerObject
+    if npc and facing then
+        npc:sendEvent('ZdorpgHold', { target = facing, seconds = seconds })
+    end
+end
+
+local function releaseNpc(npc)
+    if npc then npc:sendEvent('ZdorpgRelease') end
+end
+
 -------------------------------------------------------------------------------
 -- Incoming message handlers
 -------------------------------------------------------------------------------
@@ -258,6 +329,8 @@ local function handleGetSceneContext(msg)
             gold = goldOf(npc),
             equipped = equippedNames(npc),
             items = inventoryItems(npc, 12),
+            disposition = dispositionOf(npc),
+            services = offeredServices(npc),
         }
     end
 
@@ -272,6 +345,8 @@ local function handleGetSceneContext(msg)
             healthRatio = dynamicRatio(types.Actor.stats.dynamic.health, playerObject),
             fatigueRatio = dynamicRatio(types.Actor.stats.dynamic.fatigue, playerObject),
             equipped = equippedNames(playerObject),
+            bounty = crimeLevelOf(playerObject),
+            factions = playerFactions(playerObject),
         }
     end
 
@@ -286,6 +361,7 @@ local function handleSayMp3File(msg)
         return
     end
     print('[ZDORPG] SayMp3File: playing ' .. tostring(data.mp3Name) .. ' for ' .. tostring(data.npcId))
+    holdNpc(npc, (data.durationSec or 5) + 4, data.targetId and activeNpcs[data.targetId])
     local okSay, err = pcall(core.sound.say, 'Sound/zdorpgai_mp3/' .. data.mp3Name, npc, '')
     if not okSay then
         print('[ZDORPG] Error playing voice: ' .. tostring(err))
@@ -325,6 +401,8 @@ local function handlePlayerStartSpeak(msg)
     if playerObject then
         playerObject:sendEvent('ZdorpgShowListening', {})
     end
+    -- The NPC being addressed stops to listen
+    holdNpc(lastTargetNpcId and activeNpcs[lastTargetNpcId], 20)
 end
 
 local function handlePlayerStopSpeak(msg)
@@ -390,7 +468,9 @@ local function handleGetCharactersWhoHear(msg)
     end
 
     table.sort(characters, function(a, b) return a.distanceMeters < b.distanceMeters end)
-    respond('GetCharactersWhoHear', msg.id, { characters = characters, gameTime = gameTime, saveId = save })
+    respond('GetCharactersWhoHear', msg.id, {
+        characters = characters, gameTime = gameTime, saveId = save, cellName = cellName(speaker),
+    })
 end
 
 local function handleSpawnOnGroundInFrontOfCharacter(msg)
@@ -494,6 +574,7 @@ local function startAiPackage(msg, packageType)
     if not npc then return respondResult(msg, false, 'npc not found') end
     if not target then return respondResult(msg, false, 'target not found') end
 
+    releaseNpc(npc)
     local ok, err = pcall(function()
         npc:sendEvent('RemoveAIPackages', packageType)
         npc:sendEvent('StartAIPackage', { type = packageType, target = target })
@@ -554,6 +635,181 @@ local function handleTransferItem(msg)
     respond('TransferItem', msg.id, { success = ok, error = not ok and tostring(err) or nil, itemName = name })
 end
 
+local function handleModifyDisposition(msg)
+    local data = msg.data or {}
+    local npc = activeNpcs[data.npcId]
+    local delta = math.floor(tonumber(data.delta) or 0)
+    if not npc then return respondResult(msg, false, 'npc not found') end
+    if not playerObject then return respondResult(msg, false, 'no player') end
+
+    local ok, err = pcall(types.NPC.modifyBaseDisposition, npc, playerObject, delta)
+    respondResult(msg, ok, not ok and tostring(err) or nil)
+end
+
+-- The engine opens a service window for anyone, so check the NPC really offers it
+local function handleOpenService(msg)
+    local data = msg.data or {}
+    local npc = activeNpcs[data.npcId]
+    local service = SERVICES[data.service or '']
+    if not npc then return respondResult(msg, false, 'npc not found') end
+    if not service then return respondResult(msg, false, 'unknown service') end
+    if not offersService(npc, service) then return respondResult(msg, false, 'does not offer ' .. data.service) end
+    if not playerObject then return respondResult(msg, false, 'no player') end
+
+    releaseNpc(npc)
+    playerObject:sendEvent('AddUiMode', { mode = service.mode, target = npc })
+    respondResult(msg, true)
+end
+
+local function npcName(npcId)
+    local npc = activeNpcs[npcId]
+    local ok, record = pcall(function() return types.NPC.record(npc) end)
+    return ok and record and record.name or npcId
+end
+
+-- The NPC is working on an answer: show "Name: ..." and keep it facing the player meanwhile
+local function handleNpcThinking(msg)
+    local data = msg.data or {}
+    if not playerObject or not data.npcId then return end
+    holdNpc(activeNpcs[data.npcId], 15)
+    playerObject:sendEvent('ZdorpgShowSpeech', {
+        npcName = npcName(data.npcId),
+        text = '...',
+        animate = false,
+        durationSec = 10,
+    })
+end
+
+local function handleTaskUpdate(msg)
+    local data = msg.data or {}
+    if not playerObject then return end
+    playerObject:sendEvent('ZdorpgTaskUpdate', {
+        npcName = npcName(data.npcId),
+        task = data.description or '',
+        status = data.status,
+    })
+end
+
+-------------------------------------------------------------------------------
+-- Lore from the game's own dialogue
+-------------------------------------------------------------------------------
+
+-- Topic infos sit in a linked list (indexing is O(n)), so each topic is copied once
+local topicCache = {}
+
+local function topicInfos(topic)
+    local cached = topicCache[topic.id]
+    if cached then return cached end
+    cached = {}
+    local infos = topic.infos
+    for i = 1, #infos do
+        local info = infos[i]
+        if info.text and info.text ~= '' then
+            cached[#cached + 1] = {
+                text = info.text,
+                actorId = info.filterActorId,
+                race = info.filterActorRace,
+                class = info.filterActorClass,
+                faction = info.filterActorFaction,
+                rank = info.filterActorFactionRank,
+                gender = info.filterActorGender,
+                disposition = info.filterActorDisposition,
+                cell = info.filterPlayerCell,
+            }
+        end
+    end
+    topicCache[topic.id] = cached
+    return cached
+end
+
+local function sameId(a, b)
+    return string.lower(tostring(a)) == string.lower(tostring(b))
+end
+
+-- The filters the Lua API exposes; the dialogue's script conditions can't be checked from Lua
+local function infoMatches(info, who)
+    if info.actorId and info.actorId ~= '' and not sameId(info.actorId, who.id) then return false end
+    if info.race and info.race ~= '' and not sameId(info.race, who.race) then return false end
+    if info.class and info.class ~= '' and not sameId(info.class, who.class) then return false end
+    if info.faction then
+        -- '' means "no faction"
+        if info.faction == '' then
+            if who.faction then return false end
+        elseif not who.faction or not sameId(info.faction, who.faction) then
+            return false
+        end
+    end
+    if info.rank and info.rank > 0 and (who.rank or 0) < info.rank then return false end
+    if info.gender and info.gender ~= '' and not sameId(info.gender, who.gender) then return false end
+    if info.disposition and info.disposition > 0 and (who.disposition or 0) < info.disposition then return false end
+    if info.cell and info.cell ~= '' and string.sub(who.playerCell or '', 1, #info.cell) ~= info.cell then return false end
+    return true
+end
+
+local function fillPlaceholders(text, who)
+    local values = {
+        PCName = who.playerName, PCRace = who.playerRace, PCClass = who.playerClass,
+        Name = who.name, Race = who.raceName, Class = who.className, Faction = who.factionName,
+        Rank = who.rankName, Cell = who.playerCell,
+    }
+    return (string.gsub(text, '%%(%a+)', function(key)
+        return values[key] or ('%' .. key)
+    end))
+end
+
+local function handleGetTopics(msg)
+    local topics = json.array()
+    for _, topic in ipairs(core.dialogue.topic.records) do
+        topics[#topics + 1] = topic.id
+    end
+    respond('GetTopics', msg.id, { topics = topics })
+end
+
+-- Lines the NPC could say on each topic, as the vanilla dialogue would pick them: first matches first
+local function handleGetTopicLines(msg)
+    local data = msg.data or {}
+    local npc = activeNpcs[data.npcId]
+    local limit = data.limit or 3
+    local result = json.array()
+    local okRec, record = pcall(types.NPC.record, npc)
+    if not npc or not okRec or not record then
+        respond('GetTopicLines', msg.id, { topics = result })
+        return
+    end
+
+    local factionIds = select(2, pcall(types.NPC.getFactions, npc))
+    local factionId = type(factionIds) ~= 'string' and factionIds and factionIds[1] or nil
+    local okRank, rank = pcall(types.NPC.getFactionRank, npc, factionId)
+    local factionName, rankName = getFaction(npc)
+    local player = playerObject and getCharacterInfo(playerObject)
+    local who = {
+        id = npc.recordId, race = record.race, class = record.class, gender = record.isMale and 'male' or 'female',
+        faction = factionId, rank = okRank and rank or 0, disposition = dispositionOf(npc),
+        playerCell = playerObject and cellName(playerObject) or '',
+        name = record.name, raceName = recordName(types.NPC.races, record.race), className = recordName(types.NPC.classes, record.class),
+        factionName = factionName, rankName = rankName,
+        playerName = player and player.name, playerRace = player and recordName(types.NPC.races, player.race),
+        playerClass = player and player.className,
+    }
+
+    for _, topicId in ipairs(data.topics or {}) do
+        local topic = core.dialogue.topic.records[topicId]
+        if topic then
+            local lines = json.array()
+            for _, info in ipairs(topicInfos(topic)) do
+                if infoMatches(info, who) then
+                    lines[#lines + 1] = fillPlaceholders(info.text, who)
+                    if #lines >= limit then break end
+                end
+            end
+            if #lines > 0 then
+                result[#result + 1] = { topic = topic.name or topicId, lines = lines }
+            end
+        end
+    end
+    respond('GetTopicLines', msg.id, { topics = result })
+end
+
 local function handleShowMessageBox(msg)
     if not playerObject then return end
     local data = msg.data or {}
@@ -601,6 +857,18 @@ local function processIncomingMessage(msg)
         handleShowMessageBox(msg)
     elseif msg.type == 'TransferItem' then
         handleTransferItem(msg)
+    elseif msg.type == 'ModifyDisposition' then
+        handleModifyDisposition(msg)
+    elseif msg.type == 'OpenService' then
+        handleOpenService(msg)
+    elseif msg.type == 'NpcThinking' then
+        handleNpcThinking(msg)
+    elseif msg.type == 'TaskUpdate' then
+        handleTaskUpdate(msg)
+    elseif msg.type == 'GetTopics' then
+        handleGetTopics(msg)
+    elseif msg.type == 'GetTopicLines' then
+        handleGetTopicLines(msg)
     else
         print('[ZDORPG:ERROR] Unknown message type: ' .. tostring(msg.type))
     end
@@ -684,6 +952,7 @@ end
 -------------------------------------------------------------------------------
 
 local function onTargetChanged(data)
+    lastTargetNpcId = data.npcId
     publish('TargetChanged', {
         playerId = data.playerId,
         npcId = data.npcId,

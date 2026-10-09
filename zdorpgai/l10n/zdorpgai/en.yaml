@@ -1,1 +1,4 @@
 listening: "..."
+taskNew: "New task from {npc}: {task}"
+taskDone: "Task for {npc} done: {task}"
+taskCancelled: "{npc} called off the task: {task}"

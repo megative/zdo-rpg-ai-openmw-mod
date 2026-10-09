@@ -1,2 +1,3 @@
 GLOBAL: scripts/zdorpgai/global.lua
 PLAYER: scripts/zdorpgai/player.lua
+NPC: scripts/zdorpgai/npc.lua

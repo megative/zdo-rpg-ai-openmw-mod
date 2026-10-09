@@ -1,1 +1,4 @@
 listening: "..."
+taskNew: "Новое поручение от {npc}: {task}"
+taskDone: "Поручение для {npc} выполнено: {task}"
+taskCancelled: "{npc} отменяет поручение: {task}"
