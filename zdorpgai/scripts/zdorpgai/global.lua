@@ -231,6 +231,33 @@ local function crimeLevelOf(player)
     return ok and bounty or 0
 end
 
+-- The player's open quests, most recently updated first, each with its latest journal entry
+local function activeQuests(player, limit)
+    local result = json.array()
+    local okJournal, entries = pcall(function() return types.Player.journal(player).journalTextEntries end)
+    if not okJournal or not entries then return result end
+    local okQuests, quests = pcall(types.Player.quests, player)
+
+    local seen = {}
+    for i = #entries, 1, -1 do
+        local entry = entries[i]
+        local questId = entry.questId
+        if questId and not seen[questId] then
+            seen[questId] = true
+            local quest = okQuests and quests and quests[questId]
+            if not (quest and quest.finished) then
+                local okName, name = pcall(function() return core.dialogue.journal.records[questId].questName end)
+                result[#result + 1] = {
+                    name = (okName and name and name ~= '') and name or questId,
+                    entry = entry.text,
+                }
+                if #result >= limit then break end
+            end
+        end
+    end
+    return result
+end
+
 -- Factions the player belongs to and wasn't expelled from, with rank titles
 local function playerFactions(player)
     local factions = json.array()
@@ -349,6 +376,7 @@ local function handleGetSceneContext(msg)
             equipped = equippedNames(playerObject),
             bounty = crimeLevelOf(playerObject),
             factions = playerFactions(playerObject),
+            quests = activeQuests(playerObject, 5),
         }
     end
 
@@ -663,6 +691,46 @@ local function handleOpenService(msg)
     respondResult(msg, true)
 end
 
+-- Quest orders, quest items and faction business live in the game's own dialogue. It opens once
+-- the NPC has finished speaking: its line can come in several parts, so it waits for a pause.
+local pendingDialogue = nil
+
+local function handleOpenDialogue(msg)
+    local data = msg.data or {}
+    local npc = activeNpcs[data.npcId]
+    if not npc then return respondResult(msg, false, 'npc not found') end
+    if not playerObject then return respondResult(msg, false, 'no player') end
+
+    releaseNpc(npc)
+    pendingDialogue = { npc = npc, requestedAt = core.getRealTime(), spoke = false, quietSince = nil }
+    respondResult(msg, true)
+end
+
+local function updatePendingDialogue()
+    local pending = pendingDialogue
+    if not pending then return end
+
+    local now = core.getRealTime()
+    local okSay, speaking = pcall(core.sound.isSayActive, pending.npc)
+    if okSay and speaking then
+        pending.spoke = true
+        pending.quietSince = nil
+        return
+    end
+    pending.quietSince = pending.quietSince or now
+
+    local waited = now - pending.requestedAt
+    local finishedSpeaking = pending.spoke and now - pending.quietSince > 1
+    -- Without a spoken line, or if it never ends, don't wait forever
+    if finishedSpeaking or (not pending.spoke and waited > 4) or waited > 30 then
+        pendingDialogue = nil
+        local ok, err = pcall(function() pending.npc:activateBy(playerObject) end)
+        if not ok then
+            print('[ZDORPG] OpenDialogue failed: ' .. tostring(err))
+        end
+    end
+end
+
 local function npcName(npcId)
     local npc = activeNpcs[npcId]
     local ok, record = pcall(function() return types.NPC.record(npc) end)
@@ -874,6 +942,8 @@ local function processIncomingMessage(msg)
         handleModifyDisposition(msg)
     elseif msg.type == 'OpenService' then
         handleOpenService(msg)
+    elseif msg.type == 'OpenDialogue' then
+        handleOpenDialogue(msg)
     elseif msg.type == 'NpcThinking' then
         handleNpcThinking(msg)
     elseif msg.type == 'TaskUpdate' then
@@ -910,6 +980,8 @@ end
 -------------------------------------------------------------------------------
 
 local function onUpdate(dt)
+    updatePendingDialogue()
+
     frameCounter = frameCounter + 1
     if frameCounter % POLL_INTERVAL_FRAMES ~= 0 then return end
 
