@@ -22,4 +22,4 @@ Run client from https://github.com/drzdo/zdo-rpg-ai and client will automaticall
 ## Credits
 
 - [drzdo](https://github.com/drzdo): original author of Zdo RPG AI and its OpenMW mod.
-- [waterbobo24](https://github.com/waterbobo24): richer NPC and player context, in-game time and item transfers are ported from their forks [Morrowind-llm-server-client](https://github.com/waterbobo24/Morrowind-llm-server-client) and [Morrowind-llm-mod](https://github.com/waterbobo24/Morrowind-llm-mod).
+- [waterbobo24](https://github.com/waterbobo24): richer NPC and player context, in-game time, item transfers and per-save memory are ported from their forks [Morrowind-llm-server-client](https://github.com/waterbobo24/Morrowind-llm-server-client) and [Morrowind-llm-mod](https://github.com/waterbobo24/Morrowind-llm-mod).

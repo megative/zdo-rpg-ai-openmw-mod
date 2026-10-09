@@ -22,6 +22,18 @@ local activeNpcs = {}
 local clientConnected = false
 local currentSessionId = nil
 
+-- Identifies the playthrough: the server keeps a separate memory per save id. It is stored in
+-- saves; saves from before it existed load as 'default', the memory the server already had.
+local saveId = nil
+
+local function currentSaveId()
+    if not saveId then
+        local okTime, now = pcall(function() return os.time() end)
+        saveId = string.format('%d-%d', okTime and now or 0, math.floor(core.getRealTime() * 1000) % 1000000000)
+    end
+    return saveId
+end
+
 -------------------------------------------------------------------------------
 -- Outgoing helpers
 -------------------------------------------------------------------------------
@@ -330,8 +342,9 @@ local function handleGetCharactersWhoHear(msg)
     local data = msg.data or {}
     local characterId = data.characterId
     local gameTime = currentGameTime()
+    local save = currentSaveId()
     if not characterId then
-        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, saveId = save })
         return
     end
 
@@ -344,13 +357,13 @@ local function handleGetCharactersWhoHear(msg)
     end
 
     if not speaker then
-        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, saveId = save })
         return
     end
 
     local okPos, speakerPos = pcall(function() return speaker.position end)
     if not okPos or not speakerPos then
-        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, saveId = save })
         return
     end
 
@@ -377,7 +390,7 @@ local function handleGetCharactersWhoHear(msg)
     end
 
     table.sort(characters, function(a, b) return a.distanceMeters < b.distanceMeters end)
-    respond('GetCharactersWhoHear', msg.id, { characters = characters, gameTime = gameTime })
+    respond('GetCharactersWhoHear', msg.id, { characters = characters, gameTime = gameTime, saveId = save })
 end
 
 local function handleSpawnOnGroundInFrontOfCharacter(msg)
@@ -683,6 +696,7 @@ end
 
 local function onSave()
     return {
+        saveId = currentSaveId(),
         lastSeenClientMsgId = lastSeenClientMsgId,
         lastCellName = lastCellName,
         modMsgCounter = modMsgCounter,
@@ -700,8 +714,14 @@ local function rebuildActiveNpcs()
     print('[ZDORPG] Rebuilt activeNpcs: ' .. tostring(#world.activeActors) .. ' actors checked')
 end
 
+-- A new game: its save id is made on first use
+local function onInit()
+    saveId = nil
+end
+
 local function onLoad(data)
     if data then
+        saveId = data.saveId or 'default'
         lastSeenClientMsgId = data.lastSeenClientMsgId or 0
         lastCellName = data.lastCellName
         modMsgCounter = data.modMsgCounter or 0
@@ -727,6 +747,7 @@ print('[ZDORPG] Global script loaded')
 return {
     engineHandlers = {
         onUpdate = onUpdate,
+        onInit = onInit,
         onSave = onSave,
         onLoad = onLoad,
         onPlayerAdded = onPlayerAdded,
