@@ -22,6 +22,8 @@ local activeNpcs = {}
 local clientConnected = false
 local currentSessionId = nil
 local lastTargetNpcId = nil
+-- Push-to-talk key from the client, passed on to the player script
+local pushToTalkKey = nil
 
 -- Identifies the playthrough: the server keeps a separate memory per save id. It is stored in
 -- saves; saves from before it existed load as 'default', the memory the server already had.
@@ -810,6 +812,15 @@ local function handleGetTopicLines(msg)
     respond('GetTopicLines', msg.id, { topics = result })
 end
 
+local function handleSetPushToTalkKey(msg)
+    local data = msg.data or {}
+    if not data.key then return end
+    pushToTalkKey = data.key
+    if playerObject then
+        playerObject:sendEvent('ZdorpgSetPushToTalkKey', { key = pushToTalkKey })
+    end
+end
+
 local function handleShowMessageBox(msg)
     if not playerObject then return end
     local data = msg.data or {}
@@ -857,6 +868,8 @@ local function processIncomingMessage(msg)
         handleShowMessageBox(msg)
     elseif msg.type == 'TransferItem' then
         handleTransferItem(msg)
+    elseif msg.type == 'SetPushToTalkKey' then
+        handleSetPushToTalkKey(msg)
     elseif msg.type == 'ModifyDisposition' then
         handleModifyDisposition(msg)
     elseif msg.type == 'OpenService' then
@@ -936,6 +949,9 @@ local function onPlayerAdded(player)
     if clientConnected then
         showConnectedIndicator()
     end
+    if pushToTalkKey then
+        player:sendEvent('ZdorpgSetPushToTalkKey', { key = pushToTalkKey })
+    end
 end
 
 local function onActorActive(actor)
@@ -950,6 +966,10 @@ end
 -------------------------------------------------------------------------------
 -- Event handlers (from player script)
 -------------------------------------------------------------------------------
+
+local function onPushToTalk(data)
+    publish('PushToTalk', { pressed = data.pressed == true })
+end
 
 local function onTargetChanged(data)
     lastTargetNpcId = data.npcId
@@ -1025,5 +1045,6 @@ return {
     },
     eventHandlers = {
         ZdorpgTargetChanged = onTargetChanged,
+        ZdorpgPushToTalk = onPushToTalk,
     },
 }

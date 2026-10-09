@@ -3,8 +3,10 @@
 
 local camera = require('openmw.camera')
 local core = require('openmw.core')
+local input = require('openmw.input')
 local nearby = require('openmw.nearby')
 local self = require('openmw.self')
+local storage = require('openmw.storage')
 local types = require('openmw.types')
 local ui = require('openmw.ui')
 local util = require('openmw.util')
@@ -17,6 +19,32 @@ local frameCounter = 0
 local lastTargetId = nil
 local speechHideTime = nil
 local listeningHideTime = nil
+
+-- Push-to-talk: the game itself watches the key, so it works on any OS and under Wayland. The
+-- client says which key (an openmw.input.KEY name); it is remembered across game sessions.
+local pushToTalkStorage = storage.playerSection('ZdorpgPushToTalk')
+local pushToTalkCode = nil
+local pushToTalkPressed = false
+
+local function setPushToTalkKey(name)
+    local ok, code = pcall(function() return input.KEY[name] end)
+    if ok and code then
+        pushToTalkCode = code
+    else
+        pushToTalkCode = nil
+        print('[ZDORPG] Unknown push-to-talk key: ' .. tostring(name))
+    end
+end
+
+setPushToTalkKey(pushToTalkStorage:get('key') or 'Y')
+
+local function checkPushToTalk()
+    local pressed = pushToTalkCode ~= nil and input.isKeyPressed(pushToTalkCode)
+    if pressed ~= pushToTalkPressed then
+        pushToTalkPressed = pressed
+        core.sendGlobalEvent('ZdorpgPushToTalk', { pressed = pressed })
+    end
+end
 
 -- Typewriter animation state
 local DEFAULT_CHARS_PER_SEC = 18
@@ -226,6 +254,8 @@ end
 -------------------------------------------------------------------------------
 
 local function onFrame(dt)
+    checkPushToTalk()
+
     -- Typewriter animation (UTF-8 aware)
     if speechAnimText then
         local numChars = #speechAnimCharOffsets
@@ -290,6 +320,13 @@ local function onHideListening(data)
     hideListening()
 end
 
+local function onSetPushToTalkKey(data)
+    if data and data.key then
+        pushToTalkStorage:set('key', data.key)
+        setPushToTalkKey(data.key)
+    end
+end
+
 local function onNotify(data)
     ui.showMessage(data.text or '')
 end
@@ -347,5 +384,6 @@ return {
         ZdorpgHideListening = onHideListening,
         ZdorpgNotify = onNotify,
         ZdorpgTaskUpdate = onTaskUpdate,
+        ZdorpgSetPushToTalkKey = onSetPushToTalkKey,
     },
 }
