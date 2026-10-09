@@ -62,6 +62,39 @@ function ipc.readIncoming(vfs, lastSeenClientMsgId, currentSessionId)
     return messages, lastSeenClientMsgId, sessionId, sessionChanged
 end
 
+-- OpenMW's logger cuts output into 4 KB pieces and drops a byte at each cut, so longer messages go
+-- out as several [ZDORPG_PART] lines that the client puts back together
+local MAX_LINE_BYTES = 3000
+
+-- Moves a cut back so that the next part doesn't start in the middle of a UTF-8 character
+local function charBoundary(s, stop)
+    while stop > 1 do
+        local nextByte = s:byte(stop + 1)
+        if not nextByte or nextByte < 0x80 or nextByte >= 0xC0 then break end
+        stop = stop - 1
+    end
+    return stop
+end
+
+local function printMessage(encoded, id)
+    if #encoded <= MAX_LINE_BYTES then
+        print('[ZDORPG_MSG]' .. encoded)
+        return
+    end
+
+    local parts = {}
+    local pos = 1
+    while pos <= #encoded do
+        local stop = math.min(pos + MAX_LINE_BYTES - 1, #encoded)
+        if stop < #encoded then stop = charBoundary(encoded, stop) end
+        parts[#parts + 1] = string.sub(encoded, pos, stop)
+        pos = stop + 1
+    end
+    for i, part in ipairs(parts) do
+        print(string.format('[ZDORPG_PART]%d/%d/%d:%s', id, i, #parts, part))
+    end
+end
+
 --- Send a message to the client via print() with [ZDORPG_MSG] prefix.
 -- @param msgType    message type string
 -- @param data       payload table (or nil)
@@ -82,7 +115,7 @@ function ipc.sendMessage(msgType, data, responseTo, counter)
     end
     local okEnc, encoded = pcall(json.encode, msg)
     if okEnc and encoded then
-        print('[ZDORPG_MSG]' .. encoded)
+        printMessage(encoded, counter)
     end
     return counter
 end
