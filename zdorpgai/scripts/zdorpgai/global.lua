@@ -6,8 +6,10 @@ local types = require('openmw.types')
 local util = require('openmw.util')
 local vfs = require('openmw.vfs')
 local world = require('openmw.world')
+local calendar = require('openmw_aux.calendar')
 
 local ipc = require('scripts.zdorpgai.ipc')
+local json = require('scripts.zdorpgai.json')
 
 -- State
 local POLL_INTERVAL_FRAMES = 5
@@ -36,21 +38,148 @@ end
 -- Character info gathering
 -------------------------------------------------------------------------------
 
+-- Display name of a record (class, region, ...), falling back to its id
+local function recordName(store, id)
+    if not id then return nil end
+    local ok, record = pcall(function() return store.records[id] end)
+    if ok and record and record.name and record.name ~= '' then return record.name end
+    return id
+end
+
+-- The actor's faction and rank titles. Faction lookup follows waterbobo24's
+-- Morrowind-llm-mod (github.com/waterbobo24/Morrowind-llm-mod).
+local function getFaction(actor)
+    local ok, factionIds = pcall(types.NPC.getFactions, actor)
+    if not ok or not factionIds or #factionIds == 0 then return nil, nil end
+    local factionId = factionIds[1]
+    local okRec, faction = pcall(function() return core.factions.records[factionId] end)
+    if not okRec or not faction then return factionId, nil end
+    -- Ranks are 1-based; 0 means not a member
+    local okRank, rank = pcall(types.NPC.getFactionRank, actor, factionId)
+    local rankName = nil
+    if okRank and rank and rank > 0 and faction.ranks and faction.ranks[rank] then
+        rankName = faction.ranks[rank].name
+    end
+    return faction.name, rankName
+end
+
 local function getCharacterInfo(gameObject)
     local ok, record = pcall(types.NPC.record, gameObject)
     if not ok or not record then return nil end
 
     local health = types.Actor.stats.dynamic.health(gameObject)
+    local faction, factionRank = getFaction(gameObject)
 
     return {
         objectId = gameObject.recordId,
         name = record.name,
         race = record.race,
         sex = record.isMale and 'male' or 'female',
+        className = recordName(types.NPC.classes, record.class),
+        faction = faction,
+        factionRank = factionRank,
         isDead = types.Actor.isDead(gameObject),
         healthCurrent = health.current,
         healthMax = health.base,
     }
+end
+
+-------------------------------------------------------------------------------
+-- Scene state: what an NPC can see right now
+-------------------------------------------------------------------------------
+
+-- Same format as waterbobo24's fork: "14:05, 16 Last Seed 3E 427"
+local function currentGameTime()
+    local ok, text = pcall(calendar.formatGameTime, '%H:%M, %d %B 3E %Y')
+    return ok and text or nil
+end
+
+local function cellName(object)
+    local ok, cell = pcall(function() return object.cell end)
+    if not ok or not cell then return nil end
+    if cell.name and cell.name ~= '' then return cell.name end
+    -- Unnamed wilderness: fall back to the region
+    return recordName(core.regions, cell.region) or cell.id
+end
+
+local function actorLevel(actor)
+    local ok, level = pcall(function() return types.Actor.stats.level(actor).current end)
+    return ok and level or 0
+end
+
+-- current/max of a dynamic stat (health, fatigue) in 0..1
+local function dynamicRatio(stat, actor)
+    local ok, value = pcall(stat, actor)
+    if not ok or not value then return 1 end
+    local max = value.base + (value.modifier or 0)
+    if max <= 0 then return 1 end
+    return math.max(0, math.min(1, value.current / max))
+end
+
+local function goldOf(actor)
+    local ok, gold = pcall(function() return types.Actor.inventory(actor):countOf('gold_001') end)
+    return ok and gold or 0
+end
+
+local function itemName(item)
+    local ok, record = pcall(function() return item.type.record(item) end)
+    if ok and record and record.name and record.name ~= '' then return record.name end
+    return item.recordId
+end
+
+local function equippedItems(actor)
+    local ok, equipment = pcall(types.Actor.getEquipment, actor)
+    if not ok or not equipment then return {} end
+    return equipment
+end
+
+local function equippedNames(actor)
+    local names = json.array()
+    for _, item in pairs(equippedItems(actor)) do
+        names[#names + 1] = itemName(item)
+    end
+    table.sort(names)
+    return names
+end
+
+-- Belongings besides gold and worn gear, most valuable first: what the NPC could give or sell
+local function inventoryItems(actor, limit)
+    local inventory = types.Actor.inventory(actor)
+    pcall(function()
+        if not inventory:isResolved() then inventory:resolve() end
+    end)
+
+    local equipped = {}
+    for _, item in pairs(equippedItems(actor)) do
+        equipped[item.id] = true
+    end
+
+    local byRecord = {}
+    local list = {}
+    for _, item in ipairs(inventory:getAll()) do
+        if not equipped[item.id] and item.recordId ~= 'gold_001' then
+            local entry = byRecord[item.recordId]
+            if not entry then
+                local okRec, record = pcall(function() return item.type.record(item) end)
+                entry = {
+                    id = item.recordId,
+                    name = itemName(item),
+                    count = 0,
+                    value = (okRec and record and record.value) or 0,
+                }
+                byRecord[item.recordId] = entry
+                list[#list + 1] = entry
+            end
+            entry.count = entry.count + item.count
+        end
+    end
+
+    table.sort(list, function(a, b) return a.value * a.count > b.value * b.count end)
+    local items = json.array()
+    for i = 1, math.min(limit, #list) do
+        items[i] = { id = list[i].id, name = list[i].name, count = list[i].count }
+    end
+    return items
 end
 
 -------------------------------------------------------------------------------
@@ -96,7 +225,45 @@ local function handleGetNpcInfo(msg)
         name = info.name,
         race = info.race,
         sex = info.sex,
+        className = info.className,
+        faction = info.faction,
+        factionRank = info.factionRank,
     })
+end
+
+local function handleGetSceneContext(msg)
+    local data = msg.data or {}
+    local response = {
+        gameTime = currentGameTime(),
+        cellName = playerObject and cellName(playerObject) or nil,
+    }
+
+    local npc = activeNpcs[data.npcId]
+    if npc then
+        response.npc = {
+            level = actorLevel(npc),
+            healthRatio = dynamicRatio(types.Actor.stats.dynamic.health, npc),
+            gold = goldOf(npc),
+            equipped = equippedNames(npc),
+            items = inventoryItems(npc, 12),
+        }
+    end
+
+    local info = playerObject and getCharacterInfo(playerObject)
+    if info then
+        response.player = {
+            name = info.name,
+            race = info.race,
+            sex = info.sex,
+            className = info.className,
+            level = actorLevel(playerObject),
+            healthRatio = dynamicRatio(types.Actor.stats.dynamic.health, playerObject),
+            fatigueRatio = dynamicRatio(types.Actor.stats.dynamic.fatigue, playerObject),
+            equipped = equippedNames(playerObject),
+        }
+    end
+
+    respond('GetSceneContext', msg.id, response)
 end
 
 local function handleSayMp3File(msg)
@@ -162,8 +329,9 @@ end
 local function handleGetCharactersWhoHear(msg)
     local data = msg.data or {}
     local characterId = data.characterId
+    local gameTime = currentGameTime()
     if not characterId then
-        respond('GetCharactersWhoHear', msg.id, { characters = {} })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime })
         return
     end
 
@@ -176,20 +344,20 @@ local function handleGetCharactersWhoHear(msg)
     end
 
     if not speaker then
-        respond('GetCharactersWhoHear', msg.id, { characters = {} })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime })
         return
     end
 
     local okPos, speakerPos = pcall(function() return speaker.position end)
     if not okPos or not speakerPos then
-        respond('GetCharactersWhoHear', msg.id, { characters = {} })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime })
         return
     end
 
     local maxDistMeters = data.maxDistanceMeters or (2000 / 70)
     local maxDistUnits = maxDistMeters * 70
     local hearingRangeSq = maxDistUnits * maxDistUnits
-    local characters = {}
+    local characters = json.array()
     for id, npc in pairs(activeNpcs) do
         if id ~= characterId then
             local okDead, isDead = pcall(types.Actor.isDead, npc)
@@ -209,7 +377,7 @@ local function handleGetCharactersWhoHear(msg)
     end
 
     table.sort(characters, function(a, b) return a.distanceMeters < b.distanceMeters end)
-    respond('GetCharactersWhoHear', msg.id, { characters = characters })
+    respond('GetCharactersWhoHear', msg.id, { characters = characters, gameTime = gameTime })
 end
 
 local function handleSpawnOnGroundInFrontOfCharacter(msg)
@@ -436,6 +604,8 @@ local function processIncomingMessage(msg)
         handleGetPlayerInfo(msg)
     elseif msg.type == 'GetNpcInfo' then
         handleGetNpcInfo(msg)
+    elseif msg.type == 'GetSceneContext' then
+        handleGetSceneContext(msg)
     elseif msg.type == 'SayMp3File' then
         handleSayMp3File(msg)
     elseif msg.type == 'SpeechRecognitionInProgress' then

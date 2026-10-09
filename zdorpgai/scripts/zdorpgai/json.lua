@@ -3,6 +3,13 @@
 
 local json = {}
 
+-- An empty Lua table is ambiguous; tables made with json.array() always encode as JSON arrays
+local array_mt = {}
+
+function json.array(t)
+    return setmetatable(t or {}, array_mt)
+end
+
 -------------------------------------------------------------------------------
 -- Encode
 -------------------------------------------------------------------------------
@@ -35,7 +42,7 @@ local function is_array(t)
 end
 
 local function encode_table(val)
-    if #val > 0 or (next(val) ~= nil and is_array(val)) then
+    if getmetatable(val) == array_mt or #val > 0 or (next(val) ~= nil and is_array(val)) then
         local parts = {}
         for i = 1, #val do
             parts[i] = encode_value(val[i])
