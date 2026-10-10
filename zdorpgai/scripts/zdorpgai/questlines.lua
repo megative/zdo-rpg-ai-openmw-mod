@@ -7,8 +7,8 @@ local M = {}
 -- Quest stages a result script sets: Journal MS_FargothRing 10, SetJournalIndex, "A1_1", 1
 function M.journalCalls(script)
     local calls = {}
-    for line in string.gmatch(string.lower(script or ''), '[^\r\n]+') do
-        line = string.gsub(line, ';.*', '')
+    for rawLine in string.gmatch(string.lower(script or ''), '[^\r\n]+') do
+        local line = string.gsub(rawLine, ';.*', '')
         local questId, stage = string.match(line, '%f[%w_]journal[%s,]+"?([^%s,"]+)"?[%s,]+(%d+)')
         if not questId then
             questId, stage = string.match(line, '%f[%w_]setjournalindex[%s,]+"?([^%s,"]+)"?[%s,]+(%d+)')

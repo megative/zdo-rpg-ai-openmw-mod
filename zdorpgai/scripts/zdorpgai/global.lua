@@ -23,8 +23,10 @@ local activeNpcs = {}
 local clientConnected = false
 local currentSessionId = nil
 local lastTargetNpcId = nil
--- Push-to-talk key from the client, passed on to the player script
+-- Push-to-talk and event log keys from the client, passed on to the player script
 local pushToTalkKey = nil
+local eventLogKey = nil
+local textInputKey = nil
 
 -- Identifies the playthrough: the server keeps a separate memory per save id. It is stored in
 -- saves; saves from before it existed load as 'default', the memory the server already had.
@@ -108,6 +110,12 @@ end
 local function currentGameTime()
     local ok, text = pcall(calendar.formatGameTime, '%H:%M, %d %B 3E %Y')
     return ok and text or nil
+end
+
+-- The game clock in seconds: the server tells by it how long ago something happened
+local function gameSeconds()
+    local ok, seconds = pcall(core.getGameTime)
+    return ok and seconds or nil
 end
 
 local function cellName(object)
@@ -232,41 +240,26 @@ local function crimeLevelOf(player)
     return ok and bounty or 0
 end
 
--- The player's open quests, most recently updated first, each with its latest journal entry
-local function activeQuests(player, limit)
-    local result = json.array()
-    local okJournal, entries = pcall(function() return types.Player.journal(player).journalTextEntries end)
-    if not okJournal or not entries then return result end
-    local okQuests, quests = pcall(types.Player.quests, player)
+-- Membership these keep from outsiders: only a fellow member knows the player belongs
+local SECRET_FACTIONS = {
+    ['blades'] = true, ['thieves guild'] = true, ['morag tong'] = true, ['camonna tong'] = true,
+    ['dark brotherhood'] = true, ['clan aundae'] = true, ['clan berne'] = true, ['clan quarra'] = true,
+}
 
-    local seen = {}
-    for i = #entries, 1, -1 do
-        local entry = entries[i]
-        local questId = entry.questId
-        if questId and not seen[questId] then
-            seen[questId] = true
-            local quest = okQuests and quests and quests[questId]
-            if not (quest and quest.finished) then
-                local okName, name = pcall(function() return core.dialogue.journal.records[questId].questName end)
-                result[#result + 1] = {
-                    name = (okName and name and name ~= '') and name or questId,
-                    entry = entry.text,
-                }
-                if #result >= limit then break end
-            end
-        end
-    end
-    return result
-end
-
--- Factions the player belongs to and wasn't expelled from, with rank titles
-local function playerFactions(player)
+-- Factions the player belongs to and wasn't expelled from, with rank titles, as npc knows them
+local function playerFactions(player, npc)
     local factions = json.array()
     local ok, factionIds = pcall(types.NPC.getFactions, player)
     if not ok or not factionIds then return factions end
+    local fellow = {}
+    local okNpc, npcFactionIds = pcall(types.NPC.getFactions, npc)
+    if okNpc and npcFactionIds then
+        for _, id in ipairs(npcFactionIds) do fellow[string.lower(id)] = true end
+    end
     for _, factionId in ipairs(factionIds) do
+        local key = string.lower(factionId)
         local okExpelled, expelled = pcall(types.NPC.isExpelled, player, factionId)
-        if not (okExpelled and expelled) then
+        if not (okExpelled and expelled) and (not SECRET_FACTIONS[key] or fellow[key]) then
             local faction = core.factions.records[factionId]
             local okRank, rank = pcall(types.NPC.getFactionRank, player, factionId)
             local rankRecord = okRank and rank and rank > 0 and faction and faction.ranks[rank]
@@ -370,6 +363,40 @@ local function updateQuestLines()
     end
 end
 
+-- The player's open quests npc takes part in (its own dialogue moves them on), most recently
+-- updated first, each with its latest journal entry. The journal is the player's own: anyone
+-- else knows of a quest only from what it heard.
+local function activeQuests(player, limit, npc)
+    local result = json.array()
+    local lines = questLines and npc and questLines[string.lower(npc.recordId)]
+    if not lines then return result end
+    local involved = {}
+    for _, line in ipairs(lines) do involved[string.lower(line.questId)] = true end
+
+    local okJournal, entries = pcall(function() return types.Player.journal(player).journalTextEntries end)
+    if not okJournal or not entries then return result end
+    local okQuests, quests = pcall(types.Player.quests, player)
+
+    local seen = {}
+    for i = #entries, 1, -1 do
+        local entry = entries[i]
+        local questId = entry.questId
+        if questId and not seen[questId] and involved[string.lower(questId)] then
+            seen[questId] = true
+            local quest = okQuests and quests and quests[questId]
+            if not (quest and quest.finished) then
+                local okName, name = pcall(function() return core.dialogue.journal.records[questId].questName end)
+                result[#result + 1] = {
+                    name = (okName and name and name ~= '') and name or questId,
+                    entry = entry.text,
+                }
+                if #result >= limit then break end
+            end
+        end
+    end
+    return result
+end
+
 -- The journal entry a quest stage writes, and whether it finishes the quest
 local function journalStage(questId, stage)
     local journal = core.dialogue.journal.records[questId]
@@ -428,6 +455,35 @@ local function releaseNpc(npc)
 end
 
 -------------------------------------------------------------------------------
+-- Conversation log: who said what, for the player's log window (see player.lua)
+-------------------------------------------------------------------------------
+
+local function npcName(npcId)
+    local npc = activeNpcs[npcId]
+    local ok, record = pcall(function() return types.NPC.record(npc) end)
+    return ok and record and record.name or npcId
+end
+
+-- "16 Last Seed, 14:05"
+local function logTime()
+    local ok, text = pcall(calendar.formatGameTime, '%d %B, %H:%M')
+    return ok and text or nil
+end
+
+-- "14:05"
+local function timeOfDay()
+    local ok, text = pcall(calendar.formatGameTime, '%H:%M')
+    return ok and text or nil
+end
+
+-- who: the NPC's name, nil for the player; to: whom the line was for, if not the player or a
+-- crowd
+local function logSaid(who, to, text)
+    if not playerObject or not text or text == '' then return end
+    playerObject:sendEvent('ZdorpgSaid', { who = who, to = to, text = text, time = timeOfDay(), player = who == nil })
+end
+
+-------------------------------------------------------------------------------
 -- Incoming message handlers
 -------------------------------------------------------------------------------
 
@@ -480,6 +536,7 @@ local function handleGetSceneContext(msg)
     local data = msg.data or {}
     local response = {
         gameTime = currentGameTime(),
+        gameSeconds = gameSeconds(),
         cellName = playerObject and cellName(playerObject) or nil,
     }
 
@@ -514,8 +571,8 @@ local function handleGetSceneContext(msg)
             fatigueRatio = dynamicRatio(types.Actor.stats.dynamic.fatigue, playerObject),
             equipped = equippedNames(playerObject),
             bounty = crimeLevelOf(playerObject),
-            factions = playerFactions(playerObject),
-            quests = activeQuests(playerObject, 5),
+            factions = playerFactions(playerObject, npc),
+            quests = activeQuests(playerObject, 5, npc),
         }
     end
 
@@ -536,17 +593,19 @@ local function handleSayMp3File(msg)
         print('[ZDORPG] Error playing voice: ' .. tostring(err))
     end
     if playerObject and data.text and data.text ~= '' then
-        local npcName = data.npcId or '???'
+        local speaker = data.npcId or '???'
         local okRec, record = pcall(types.NPC.record, npc)
         if okRec and record then
-            npcName = record.name
+            speaker = record.name
         end
         playerObject:sendEvent('ZdorpgShowSpeech', {
-            npcName = npcName,
+            npcName = speaker,
             text = data.text,
             animate = true,
             durationSec = data.durationSec,
         })
+        local to = data.targetId and data.targetId ~= playerObject.recordId and activeNpcs[data.targetId] and npcName(data.targetId) or nil
+        logSaid(speaker, to, data.text)
     end
 end
 
@@ -564,6 +623,7 @@ local function handleSpeechRecognitionComplete(msg)
     playerObject:sendEvent('ZdorpgShowListening', {
         text = data.text or '',
     })
+    logSaid(nil, lastTargetNpcId and npcName(lastTargetNpcId), data.text)
 end
 
 local function handlePlayerStartSpeak(msg)
@@ -591,7 +651,7 @@ local function handleGetCharactersWhoHear(msg)
     local gameTime = currentGameTime()
     local save = currentSaveId()
     if not characterId then
-        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, saveId = save })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, gameSeconds = gameSeconds(), saveId = save })
         return
     end
 
@@ -604,13 +664,13 @@ local function handleGetCharactersWhoHear(msg)
     end
 
     if not speaker then
-        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, saveId = save })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, gameSeconds = gameSeconds(), saveId = save })
         return
     end
 
     local okPos, speakerPos = pcall(function() return speaker.position end)
     if not okPos or not speakerPos then
-        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, saveId = save })
+        respond('GetCharactersWhoHear', msg.id, { characters = json.array(), gameTime = gameTime, gameSeconds = gameSeconds(), saveId = save })
         return
     end
 
@@ -638,7 +698,7 @@ local function handleGetCharactersWhoHear(msg)
 
     table.sort(characters, function(a, b) return a.distanceMeters < b.distanceMeters end)
     respond('GetCharactersWhoHear', msg.id, {
-        characters = characters, gameTime = gameTime, saveId = save, cellName = cellName(speaker),
+        characters = characters, gameTime = gameTime, gameSeconds = gameSeconds(), saveId = save, cellName = cellName(speaker),
     })
 end
 
@@ -721,6 +781,20 @@ local function handlePlaySound3dOnCharacter(msg)
     end
 end
 
+-------------------------------------------------------------------------------
+-- Event log: what NPCs did for or to the player (see player.lua)
+-------------------------------------------------------------------------------
+
+-- A notification for the player and a line in their event log. kind: received, given,
+-- disposition, follow, stopFollow, attack, stopAttack or task
+local function logEvent(kind, npcId, data)
+    if not playerObject then return end
+    data.kind = kind
+    data.npcName = npcName(npcId)
+    data.time = logTime()
+    playerObject:sendEvent('ZdorpgLogEvent', data)
+end
+
 -- 'player' is how the server refers to the player character
 local function findActor(id)
     if not id then return nil end
@@ -736,7 +810,8 @@ local function respondResult(msg, ok, err)
     respond(msg.type, msg.id, { success = ok, error = err })
 end
 
-local function startAiPackage(msg, packageType)
+-- logKind: what goes into the player's event log when it worked (see logEvent)
+local function startAiPackage(msg, packageType, logKind)
     local data = msg.data or {}
     local npc = activeNpcs[data.npcId]
     local target = findActor(data.targetCharacterId)
@@ -749,21 +824,27 @@ local function startAiPackage(msg, packageType)
         npc:sendEvent('StartAIPackage', { type = packageType, target = target })
     end)
     respondResult(msg, ok, not ok and tostring(err) or nil)
+    if ok and target == playerObject then
+        logEvent(logKind, data.npcId, {})
+    end
 end
 
-local function removeAiPackages(msg, packageType)
+local function removeAiPackages(msg, packageType, logKind)
     local data = msg.data or {}
     local npc = activeNpcs[data.npcId]
     if not npc then return respondResult(msg, false, 'npc not found') end
 
     local ok, err = pcall(function() npc:sendEvent('RemoveAIPackages', packageType) end)
     respondResult(msg, ok, not ok and tostring(err) or nil)
+    if ok then
+        logEvent(logKind, data.npcId, {})
+    end
 end
 
-local function handleNpcStartFollowCharacter(msg) startAiPackage(msg, 'Follow') end
-local function handleNpcStopFollowCharacter(msg) removeAiPackages(msg, 'Follow') end
-local function handleNpcAttack(msg) startAiPackage(msg, 'Combat') end
-local function handleNpcStopAttack(msg) removeAiPackages(msg, 'Combat') end
+local function handleNpcStartFollowCharacter(msg) startAiPackage(msg, 'Follow', 'follow') end
+local function handleNpcStopFollowCharacter(msg) removeAiPackages(msg, 'Follow', 'stopFollow') end
+local function handleNpcAttack(msg) startAiPackage(msg, 'Combat', 'attack') end
+local function handleNpcStopAttack(msg) removeAiPackages(msg, 'Combat', 'stopAttack') end
 
 -- Moves the actual stacks, so condition, charge and souls survive. Checking that the giver
 -- really has the items follows waterbobo24's Morrowind-llm-mod.
@@ -800,6 +881,10 @@ local function handleTransferItem(msg)
     end)
     if not ok then
         print('[ZDORPG] TransferItem failed: ' .. tostring(err))
+    elseif to == playerObject then
+        logEvent('received', data.fromCharacterId, { item = name or itemId, count = count })
+    elseif from == playerObject then
+        logEvent('given', data.toCharacterId, { item = name or itemId, count = count })
     end
     respond('TransferItem', msg.id, { success = ok, error = not ok and tostring(err) or nil, itemName = name })
 end
@@ -813,6 +898,9 @@ local function handleModifyDisposition(msg)
 
     local ok, err = pcall(types.NPC.modifyBaseDisposition, npc, playerObject, delta)
     respondResult(msg, ok, not ok and tostring(err) or nil)
+    if ok and delta ~= 0 then
+        logEvent('disposition', data.npcId, { delta = delta, reason = data.reason })
+    end
 end
 
 -- The engine opens a service window for anyone, so check the NPC really offers it
@@ -871,12 +959,6 @@ local function updatePendingDialogue()
     end
 end
 
-local function npcName(npcId)
-    local npc = activeNpcs[npcId]
-    local ok, record = pcall(function() return types.NPC.record(npc) end)
-    return ok and record and record.name or npcId
-end
-
 -- The NPC is working on an answer: show "Name: ..." and keep it facing the player meanwhile
 local function handleNpcThinking(msg)
     local data = msg.data or {}
@@ -890,13 +972,14 @@ local function handleNpcThinking(msg)
     })
 end
 
+-- Status: Open (a new task), Done or Cancelled
 local function handleTaskUpdate(msg)
     local data = msg.data or {}
-    if not playerObject then return end
-    playerObject:sendEvent('ZdorpgTaskUpdate', {
-        npcName = npcName(data.npcId),
-        task = data.description or '',
+    logEvent('task', data.npcId, {
         status = data.status,
+        task = data.description or '',
+        taskId = data.taskId,
+        reward = data.reward,
     })
 end
 
@@ -1003,6 +1086,24 @@ local function handleSetPushToTalkKey(msg)
     end
 end
 
+local function handleSetEventLogKey(msg)
+    local data = msg.data or {}
+    if not data.key then return end
+    eventLogKey = data.key
+    if playerObject then
+        playerObject:sendEvent('ZdorpgSetEventLogKey', { key = eventLogKey })
+    end
+end
+
+local function handleSetTextInputKey(msg)
+    local data = msg.data or {}
+    if not data.key then return end
+    textInputKey = data.key
+    if playerObject then
+        playerObject:sendEvent('ZdorpgSetTextInputKey', { key = textInputKey })
+    end
+end
+
 local function handleShowMessageBox(msg)
     if not playerObject then return end
     local data = msg.data or {}
@@ -1052,6 +1153,10 @@ local function processIncomingMessage(msg)
         handleTransferItem(msg)
     elseif msg.type == 'SetPushToTalkKey' then
         handleSetPushToTalkKey(msg)
+    elseif msg.type == 'SetEventLogKey' then
+        handleSetEventLogKey(msg)
+    elseif msg.type == 'SetTextInputKey' then
+        handleSetTextInputKey(msg)
     elseif msg.type == 'ModifyDisposition' then
         handleModifyDisposition(msg)
     elseif msg.type == 'OpenService' then
@@ -1075,16 +1180,15 @@ end
 -- Cell change detection
 -------------------------------------------------------------------------------
 
+-- Unnamed wilderness reports its region, so walking within one region is no change
 local function checkCellChange()
     if not playerObject then return end
-    local ok, cell = pcall(function() return playerObject.cell end)
-    if not ok or not cell then return end
-    local cellName = cell.name or cell.id
-    if cellName ~= lastCellName then
-        lastCellName = cellName
+    local name = cellName(playerObject)
+    if name and name ~= lastCellName then
+        lastCellName = name
         publish('CellChange', {
             playerId = playerObject.recordId,
-            cellName = cellName,
+            cellName = name,
         })
     end
 end
@@ -1139,6 +1243,12 @@ local function onPlayerAdded(player)
     if pushToTalkKey then
         player:sendEvent('ZdorpgSetPushToTalkKey', { key = pushToTalkKey })
     end
+    if eventLogKey then
+        player:sendEvent('ZdorpgSetEventLogKey', { key = eventLogKey })
+    end
+    if textInputKey then
+        player:sendEvent('ZdorpgSetTextInputKey', { key = textInputKey })
+    end
 end
 
 local function onActorActive(actor)
@@ -1156,6 +1266,21 @@ end
 
 local function onPushToTalk(data)
     publish('PushToTalk', { pressed = data.pressed == true })
+end
+
+-- A line the player typed: said to the NPC they look at, like speech
+local function onPlayerTyped(data)
+    local text = data and data.text
+    if not playerObject or not text or text == '' then return end
+    publish('PlayerSpeaksText', {
+        playerId = playerObject.recordId,
+        text = text,
+        targetCharacterId = lastTargetNpcId,
+        gameTime = currentGameTime() or '0',
+    })
+    holdNpc(lastTargetNpcId and activeNpcs[lastTargetNpcId], 20)
+    playerObject:sendEvent('ZdorpgShowListening', { text = text })
+    logSaid(nil, lastTargetNpcId and npcName(lastTargetNpcId), text)
 end
 
 local function onTargetChanged(data)
@@ -1233,5 +1358,6 @@ return {
     eventHandlers = {
         ZdorpgTargetChanged = onTargetChanged,
         ZdorpgPushToTalk = onPushToTalk,
+        ZdorpgPlayerTyped = onPlayerTyped,
     },
 }
